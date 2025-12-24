@@ -1,0 +1,54 @@
+type Function {
+  id: ID!
+  name: String!
+  language: Language!
+  code: String!
+  createdAt: String!
+}
+
+enum Language {
+  PYTHON
+  NODEJS
+  GO
+}
+
+type Execution {
+  id: ID!
+  functionId: ID!
+  status: Status!
+  result: String
+}
+
+enum Status {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+type Log {
+  executionId: ID!
+  message: String!
+  level: String! # "stdout" or "stderr"
+  timestamp: String!
+}
+
+type Query {
+  # List all functions created
+  functions: [Function!]!
+  # Get details of a specific execution
+  execution(id: ID!): Execution
+}
+
+type Mutation {
+  # 1. Create the function definition
+  createFunction(name: String!, language: Language!, code: String!): Function!
+
+  # 2. Trigger the function (This sends it to Redis)
+  runFunction(functionId: ID!): Execution!
+}
+
+type Subscription {
+  # 3. Stream logs live from the Podman container
+  functionLogs(executionId: ID!): Log!
+}
