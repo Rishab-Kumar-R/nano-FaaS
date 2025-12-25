@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Rishab-Kumar-R/nano-faas/worker/internal/runtime"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -23,28 +24,30 @@ type JobPayload struct {
 
 func main() {
 	ctx := context.Background()
+	engine, err := runtime.NewManager()
+	if err != nil {
+		panic(fmt.Sprintf("Failed to connect to Podman: %v", err))
+	}
+
+	fmt.Println("Connected to Podman Socket")
 	fmt.Println("Worker started. Waiting for jobs...")
 
 	for {
 		result, err := rdb.BLPop(ctx, 0*time.Second, JobQueue).Result()
 		if err != nil {
-			fmt.Println("Error fetching job:", err)
 			continue
 		}
 
-		processJob(result[1])
+		var job JobPayload
+		json.Unmarshal([]byte(result[1]), &job)
+
+		fmt.Printf("Running Job: %s\n", job.ID)
+
+		output, err := engine.RunCode(ctx, job.ID, job.Language, job.Code)
+		if err != nil {
+			fmt.Printf("Execution Failed: %v\n", err)
+		} else {
+			fmt.Printf("Result: %s\n", output)
+		}
 	}
-}
-
-func processJob(jsonPayload string) {
-	var job JobPayload
-	json.Unmarshal([]byte(jsonPayload), &job)
-
-	fmt.Printf("\n>> Processing Job: %s\n", job.ID)
-	fmt.Printf(">> [Lang]: %s\n", job.Language)
-	fmt.Printf(">> [Code]: %s\n", job.Code)
-
-	time.Sleep(2 * time.Second)
-
-	fmt.Println("Job Completed")
 }
