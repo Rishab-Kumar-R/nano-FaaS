@@ -35,8 +35,8 @@ jobs:
         working-directory: worker
         run: go test ./... -race -count=1
 
-  lint:
-    name: Lint
+  lint-gateway:
+    name: Lint gateway
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,11 +44,23 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: gateway/go.mod
+          cache-dependency-path: gateway/go.sum
 
       - uses: golangci/golangci-lint-action@v6
         with:
           working-directory: gateway
           version: latest
+
+  lint-worker:
+    name: Lint worker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: worker/go.mod
+          cache-dependency-path: worker/go.sum
 
       - uses: golangci/golangci-lint-action@v6
         with:
