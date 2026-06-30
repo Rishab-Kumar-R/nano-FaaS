@@ -49,7 +49,7 @@ jobs:
       - uses: golangci/golangci-lint-action@v6
         with:
           working-directory: gateway
-          version: latest
+          version: v1.65.0
 
   lint-worker:
     name: Lint worker
@@ -65,7 +65,7 @@ jobs:
       - uses: golangci/golangci-lint-action@v6
         with:
           working-directory: worker
-          version: latest
+          version: v1.65.0
 
   build-images:
     name: Build images
