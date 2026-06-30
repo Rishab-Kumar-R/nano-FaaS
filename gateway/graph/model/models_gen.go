@@ -9,6 +9,14 @@ import (
 	"strconv"
 )
 
+type DeadLetterJob struct {
+	ExecutionID string `json:"executionId"`
+	FunctionID  string `json:"functionId"`
+	Language    string `json:"language"`
+	Error       string `json:"error"`
+	Retries     int32  `json:"retries"`
+}
+
 type Execution struct {
 	ID         string  `json:"id"`
 	FunctionID string  `json:"functionId"`
@@ -35,6 +43,12 @@ type Mutation struct {
 }
 
 type Query struct {
+}
+
+type Schedule struct {
+	ID         string `json:"id"`
+	FunctionID string `json:"functionId"`
+	Cron       string `json:"cron"`
 }
 
 type Subscription struct {

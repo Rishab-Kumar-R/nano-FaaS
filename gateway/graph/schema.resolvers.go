@@ -14,6 +14,7 @@ import (
 	"github.com/Rishab-Kumar-R/nano-faas/gateway/graph/model"
 	"github.com/Rishab-Kumar-R/nano-faas/shared"
 	"github.com/google/uuid"
+	"github.com/robfig/cron/v3"
 )
 
 const jobQueue = "job_queue"
@@ -42,8 +43,50 @@ func (r *mutationResolver) CreateFunction(ctx context.Context, name string, lang
 	return fn, nil
 }
 
+// UpdateFunction is the resolver for the updateFunction field.
+func (r *mutationResolver) UpdateFunction(ctx context.Context, id string, name *string, code *string) (*model.Function, error) {
+	val, err := r.Redis.HGet(ctx, "function:"+id, "meta").Result()
+	if err != nil {
+		return nil, fmt.Errorf("function not found")
+	}
+
+	var fn model.Function
+	if err := json.Unmarshal([]byte(val), &fn); err != nil {
+		return nil, fmt.Errorf("failed to parse function: %v", err)
+	}
+
+	if name != nil {
+		fn.Name = *name
+	}
+	if code != nil {
+		fn.Code = *code
+	}
+
+	data, err := json.Marshal(fn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize function: %v", err)
+	}
+
+	if err := r.Redis.HSet(ctx, "function:"+id, "meta", data).Err(); err != nil {
+		return nil, fmt.Errorf("failed to update function: %v", err)
+	}
+
+	return &fn, nil
+}
+
+// DeleteFunction is the resolver for the deleteFunction field.
+func (r *mutationResolver) DeleteFunction(ctx context.Context, id string) (bool, error) {
+	pipe := r.Redis.Pipeline()
+	pipe.Del(ctx, "function:"+id)
+	pipe.Del(ctx, "executions:"+id)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // RunFunction is the resolver for the runFunction field.
-func (r *mutationResolver) RunFunction(ctx context.Context, functionID string) (*model.Execution, error) {
+func (r *mutationResolver) RunFunction(ctx context.Context, functionID string, input *string) (*model.Execution, error) {
 	val, err := r.Redis.HGet(ctx, "function:"+functionID, "meta").Result()
 	if err != nil {
 		return nil, fmt.Errorf("function not found: %v", err)
@@ -75,6 +118,9 @@ func (r *mutationResolver) RunFunction(ctx context.Context, functionID string) (
 		Language:    fn.Language.String(),
 		Code:        fn.Code,
 	}
+	if input != nil {
+		job.Input = *input
+	}
 
 	jobData, err := json.Marshal(job)
 	if err != nil {
@@ -90,6 +136,45 @@ func (r *mutationResolver) RunFunction(ctx context.Context, functionID string) (
 		FunctionID: functionID,
 		Status:     model.StatusQueued,
 	}, nil
+}
+
+// ScheduleFunction is the resolver for the scheduleFunction field.
+func (r *mutationResolver) ScheduleFunction(ctx context.Context, functionID string, cronExpr string) (*model.Schedule, error) {
+	if _, err := r.Redis.HGet(ctx, "function:"+functionID, "meta").Result(); err != nil {
+		return nil, fmt.Errorf("function not found")
+	}
+
+	// Validate cron expression before storing.
+	p := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+	if _, err := p.Parse(cronExpr); err != nil {
+		return nil, fmt.Errorf("invalid cron expression: %v", err)
+	}
+
+	id := uuid.NewString()
+
+	pipe := r.Redis.Pipeline()
+	pipe.HSet(ctx, "schedule:"+id, "id", id, "functionId", functionID, "cron", cronExpr)
+	pipe.SAdd(ctx, "schedules", id)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, fmt.Errorf("failed to save schedule: %v", err)
+	}
+
+	r.Redis.Publish(ctx, "schedules:changed", "created:"+id)
+
+	return &model.Schedule{ID: id, FunctionID: functionID, Cron: cronExpr}, nil
+}
+
+// DeleteSchedule is the resolver for the deleteSchedule field.
+func (r *mutationResolver) DeleteSchedule(ctx context.Context, id string) (bool, error) {
+	pipe := r.Redis.Pipeline()
+	pipe.SRem(ctx, "schedules", id)
+	pipe.Del(ctx, "schedule:"+id)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return false, err
+	}
+
+	r.Redis.Publish(ctx, "schedules:changed", "deleted:"+id)
+	return true, nil
 }
 
 // Functions is the resolver for the functions field.
@@ -161,6 +246,54 @@ func (r *queryResolver) ExecutionsByFunction(ctx context.Context, functionID str
 	return executions, nil
 }
 
+// Schedules is the resolver for the schedules field.
+func (r *queryResolver) Schedules(ctx context.Context) ([]*model.Schedule, error) {
+	ids, err := r.Redis.SMembers(ctx, "schedules").Result()
+	if err != nil {
+		return nil, err
+	}
+
+	var schedules []*model.Schedule
+	for _, id := range ids {
+		vals, err := r.Redis.HGetAll(ctx, "schedule:"+id).Result()
+		if err != nil || len(vals) == 0 {
+			continue
+		}
+		schedules = append(schedules, &model.Schedule{
+			ID:         vals["id"],
+			FunctionID: vals["functionId"],
+			Cron:       vals["cron"],
+		})
+	}
+
+	return schedules, nil
+}
+
+// DeadLetterJobs is the resolver for the deadLetterJobs field.
+func (r *queryResolver) DeadLetterJobs(ctx context.Context) ([]*model.DeadLetterJob, error) {
+	items, err := r.Redis.LRange(ctx, "dead_letter_queue", 0, -1).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	var jobs []*model.DeadLetterJob
+	for _, item := range items {
+		var entry shared.DeadLetterEntry
+		if err := json.Unmarshal([]byte(item), &entry); err != nil {
+			continue
+		}
+		jobs = append(jobs, &model.DeadLetterJob{
+			ExecutionID: entry.ExecutionID,
+			FunctionID:  entry.FunctionID,
+			Language:    entry.Language,
+			Error:       entry.Error,
+			Retries:     int32(entry.Retries),
+		})
+	}
+
+	return jobs, nil
+}
+
 // FunctionLogs is the resolver for the functionLogs field.
 func (r *subscriptionResolver) FunctionLogs(ctx context.Context, executionID string) (<-chan *model.Log, error) {
 	ch := make(chan *model.Log, 100)
@@ -191,13 +324,8 @@ func (r *subscriptionResolver) FunctionLogs(ctx context.Context, executionID str
 	return ch, nil
 }
 
-// Mutation returns MutationResolver implementation.
-func (r *Resolver) Mutation() MutationResolver { return &mutationResolver{r} }
-
-// Query returns QueryResolver implementation.
-func (r *Resolver) Query() QueryResolver { return &queryResolver{r} }
-
-// Subscription returns SubscriptionResolver implementation.
+func (r *Resolver) Mutation() MutationResolver     { return &mutationResolver{r} }
+func (r *Resolver) Query() QueryResolver           { return &queryResolver{r} }
 func (r *Resolver) Subscription() SubscriptionResolver { return &subscriptionResolver{r} }
 
 type mutationResolver struct{ *Resolver }
