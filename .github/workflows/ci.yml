@@ -46,7 +46,7 @@ jobs:
           go-version-file: gateway/go.mod
           cache-dependency-path: gateway/go.sum
 
-      - uses: golangci/golangci-lint-action@v6
+      - uses: golangci/golangci-lint-action@v7
         with:
           working-directory: gateway
           version: v2.12.2
@@ -62,7 +62,7 @@ jobs:
           go-version-file: worker/go.mod
           cache-dependency-path: worker/go.sum
 
-      - uses: golangci/golangci-lint-action@v6
+      - uses: golangci/golangci-lint-action@v7
         with:
           working-directory: worker
           version: v2.12.2
