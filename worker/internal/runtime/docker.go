@@ -1,15 +1,23 @@
 package runtime
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
+)
+
+const (
+	memoryLimit = 128 * 1024 * 1024 // 128 MB
+	nanoCPUs    = 500_000_000        // 0.5 CPU
 )
 
 type Manager struct {
@@ -24,7 +32,6 @@ func NewManager() (*Manager, error) {
 		client.WithHost(socketPath),
 		client.WithAPIVersionNegotiation(),
 	)
-
 	if err != nil {
 		return nil, err
 	}
@@ -32,55 +39,102 @@ func NewManager() (*Manager, error) {
 	return &Manager{cli: cli}, nil
 }
 
-func (m *Manager) RunCode(ctx context.Context, id string, language string, code string) (string, error) {
-	img := "python:3.9-alpine"
-	cmd := []string{"python", "-c", code}
+func (m *Manager) RunCode(ctx context.Context, language, code string, publish func(msg, level string)) error {
+	img, cmd, env := runtimeConfig(language, code)
 
-	switch language {
-	case "NODEJS":
-		img = "node:18-alpine"
-		cmd = []string{"node", "-e", code}
-	case "GO":
-		img = "python:3.9-alpine"
-	}
-
-	_, err := m.cli.ImagePull(ctx, img, image.PullOptions{})
+	reader, err := m.cli.ImagePull(ctx, img, image.PullOptions{})
 	if err != nil {
-		return "", fmt.Errorf("failed to pull image: %v", err)
+		return fmt.Errorf("failed to pull image: %v", err)
 	}
+	io.Copy(io.Discard, reader)
+	reader.Close()
 
-	resp, err := m.cli.ContainerCreate(ctx, &container.Config{
-		Image: img,
-		Cmd:   cmd,
-		Tty:   false,
-	}, nil, nil, nil, "nano-"+id)
-
+	resp, err := m.cli.ContainerCreate(ctx,
+		&container.Config{
+			Image: img,
+			Cmd:   cmd,
+			Env:   env,
+			Tty:   false,
+		},
+		&container.HostConfig{
+			Resources: container.Resources{
+				Memory:   memoryLimit,
+				NanoCPUs: nanoCPUs,
+			},
+			NetworkMode: "none", // no outbound network access
+		},
+		nil, nil, "")
 	if err != nil {
-		return "", fmt.Errorf("failed to create container: %v", err)
+		return fmt.Errorf("failed to create container: %v", err)
 	}
+
+	// Use a background context for cleanup so it runs even if ctx is cancelled (timeout).
+	defer func() {
+		cleanupCtx := context.Background()
+		m.cli.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{Force: true})
+	}()
 
 	if err := m.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-		return "", fmt.Errorf("failed to start: %v", err)
+		return fmt.Errorf("failed to start container: %v", err)
 	}
 
-	statusCh, errCh := m.cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
-	select {
-	case err := <-errCh:
-		if err != nil {
-			return "", err
-		}
-	case <-statusCh:
-	}
-
-	out, err := m.cli.ContainerLogs(ctx, resp.ID, container.LogsOptions{ShowStdout: true, ShowStderr: true})
+	logOut, err := m.cli.ContainerLogs(ctx, resp.ID, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     true,
+	})
 	if err != nil {
-		return "", err
+		return fmt.Errorf("failed to attach logs: %v", err)
 	}
+	defer logOut.Close()
 
-	buf := new(strings.Builder)
-	stdcopy.StdCopy(buf, os.Stderr, out)
+	stdoutR, stdoutW := io.Pipe()
+	stderrR, stderrW := io.Pipe()
 
-	m.cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stdoutR)
+		for scanner.Scan() {
+			publish(scanner.Text(), "stdout")
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stderrR)
+		for scanner.Scan() {
+			publish(scanner.Text(), "stderr")
+		}
+	}()
 
-	return buf.String(), nil
+	stdcopy.StdCopy(stdoutW, stderrW, logOut)
+	stdoutW.Close()
+	stderrW.Close()
+	wg.Wait()
+
+	return ctx.Err()
+}
+
+func runtimeConfig(language, code string) (img string, cmd []string, env []string) {
+	switch language {
+	case "NODEJS":
+		return "node:18-alpine", []string{"node", "-e", code}, nil
+	case "GO":
+		// Code passed via env var to avoid shell-escaping issues.
+		// Auto-wrap bare snippets (no package declaration) in a main() function.
+		return "golang:1.21-alpine",
+			[]string{"sh", "-c", `printf '%s' "$NANO_CODE" > /tmp/main.go && go run /tmp/main.go`},
+			[]string{"NANO_CODE=" + wrapGoCode(code)}
+	default: // PYTHON
+		return "python:3.9-alpine", []string{"python", "-c", code}, nil
+	}
+}
+
+// wrapGoCode adds a package main + func main() around snippets that omit them.
+func wrapGoCode(code string) string {
+	if strings.Contains(code, "package main") {
+		return code
+	}
+	return "package main\n\nfunc main() {\n" + code + "\n}\n"
 }

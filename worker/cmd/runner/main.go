@@ -4,50 +4,119 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
+	"github.com/Rishab-Kumar-R/nano-faas/shared"
 	"github.com/Rishab-Kumar-R/nano-faas/worker/internal/runtime"
 	"github.com/redis/go-redis/v9"
 )
 
-var rdb = redis.NewClient(&redis.Options{
-	Addr: "localhost:6379",
-})
-
-const JobQueue = "job_queue"
-
-type JobPayload struct {
-	ID       string `json:"id"`
-	Language string `json:"language"`
-	Code     string `json:"code"`
-}
+const jobQueue = "job_queue"
 
 func main() {
-	ctx := context.Background()
-	engine, err := runtime.NewManager()
-	if err != nil {
-		panic(fmt.Sprintf("Failed to connect to Podman: %v", err))
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
 	}
 
-	fmt.Println("Connected to Podman Socket")
-	fmt.Println("Worker started. Waiting for jobs...")
+	workerCount := 5
+	if v := os.Getenv("WORKER_COUNT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			workerCount = n
+		}
+	}
 
+	execTimeout := 30 * time.Second
+	if v := os.Getenv("EXEC_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			execTimeout = time.Duration(n) * time.Second
+		}
+	}
+
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+	ctx := context.Background()
+
+	engine, err := runtime.NewManager()
+	if err != nil {
+		panic(fmt.Sprintf("failed to connect to Podman: %v", err))
+	}
+
+	fmt.Printf("Connected to Podman. Starting %d workers (timeout: %s)...\n", workerCount, execTimeout)
+
+	var wg sync.WaitGroup
+	for i := range workerCount {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			runWorker(ctx, rdb, engine, execTimeout, id)
+		}(i)
+	}
+	wg.Wait()
+}
+
+func runWorker(ctx context.Context, rdb *redis.Client, engine *runtime.Manager, timeout time.Duration, id int) {
 	for {
-		result, err := rdb.BLPop(ctx, 0*time.Second, JobQueue).Result()
+		result, err := rdb.BLPop(ctx, 0, jobQueue).Result()
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			fmt.Printf("[worker %d] queue error: %v\n", id, err)
 			continue
 		}
 
-		var job JobPayload
-		json.Unmarshal([]byte(result[1]), &job)
-
-		fmt.Printf("Running Job: %s\n", job.ID)
-
-		output, err := engine.RunCode(ctx, job.ID, job.Language, job.Code)
-		if err != nil {
-			fmt.Printf("Execution Failed: %v\n", err)
-		} else {
-			fmt.Printf("Result: %s\n", output)
+		var job shared.JobPayload
+		if err := json.Unmarshal([]byte(result[1]), &job); err != nil {
+			fmt.Printf("[worker %d] failed to parse job: %v\n", id, err)
+			continue
 		}
+
+		fmt.Printf("[worker %d] running job %s (function %s)\n", id, job.ExecutionID, job.FunctionID)
+		processJob(ctx, rdb, engine, timeout, job)
 	}
+}
+
+func processJob(ctx context.Context, rdb *redis.Client, engine *runtime.Manager, timeout time.Duration, job shared.JobPayload) {
+	setStatus(ctx, rdb, job.ExecutionID, "RUNNING", "")
+
+	execCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var outputLines []string
+	publish := func(msg, level string) {
+		if level == "stdout" {
+			outputLines = append(outputLines, msg)
+		}
+		entry := shared.LogEntry{
+			Message:   msg,
+			Level:     level,
+			Timestamp: time.Now().Format(time.RFC3339),
+		}
+		data, _ := json.Marshal(entry)
+		rdb.Publish(ctx, "logs:"+job.ExecutionID, data)
+	}
+
+	err := engine.RunCode(execCtx, job.Language, job.Code, publish)
+
+	done, _ := json.Marshal(shared.LogEntry{Done: true})
+	rdb.Publish(ctx, "logs:"+job.ExecutionID, done)
+
+	if err != nil {
+		fmt.Printf("job %s failed: %v\n", job.ExecutionID, err)
+		setStatus(ctx, rdb, job.ExecutionID, "FAILED", err.Error())
+	} else {
+		setStatus(ctx, rdb, job.ExecutionID, "COMPLETED", strings.Join(outputLines, "\n"))
+	}
+}
+
+func setStatus(ctx context.Context, rdb *redis.Client, execID, status, result string) {
+	args := []any{"status", status}
+	if result != "" {
+		args = append(args, "result", result)
+	}
+	rdb.HSet(ctx, "execution:"+execID, args...)
 }

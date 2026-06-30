@@ -12,20 +12,17 @@ import (
 	"time"
 
 	"github.com/Rishab-Kumar-R/nano-faas/gateway/graph/model"
-	"github.com/redis/go-redis/v9"
+	"github.com/Rishab-Kumar-R/nano-faas/shared"
+	"github.com/google/uuid"
 )
 
-var rdb = redis.NewClient(&redis.Options{
-	Addr: "localhost:6379",
-})
-
-const JobQueue = "job_queue"
+const jobQueue = "job_queue"
 
 // CreateFunction is the resolver for the createFunction field.
 func (r *mutationResolver) CreateFunction(ctx context.Context, name string, language model.Language, code string) (*model.Function, error) {
-	id := fmt.Sprintf("func-%d", time.Now().Unix())
+	id := uuid.NewString()
 
-	newFunc := &model.Function{
+	fn := &model.Function{
 		ID:        id,
 		Name:      name,
 		Language:  language,
@@ -33,63 +30,165 @@ func (r *mutationResolver) CreateFunction(ctx context.Context, name string, lang
 		CreatedAt: time.Now().Format(time.RFC3339),
 	}
 
-	data, _ := json.Marshal(newFunc)
-
-	err := rdb.HSet(ctx, "function:"+id, "meta", data).Err()
+	data, err := json.Marshal(fn)
 	if err != nil {
+		return nil, fmt.Errorf("failed to serialize function: %v", err)
+	}
+
+	if err := r.Redis.HSet(ctx, "function:"+id, "meta", data).Err(); err != nil {
 		return nil, fmt.Errorf("failed to save function: %v", err)
 	}
 
-	task := map[string]string{
-		"id":       id,
-		"language": newFunc.Language.String(),
-		"code":     newFunc.Code,
-	}
-
-	taskJSON, _ := json.Marshal(task)
-	err = rdb.RPush(ctx, JobQueue, taskJSON).Err()
-	if err != nil {
-		return nil, fmt.Errorf("failed to queue job: %v", err)
-	}
-
-	fmt.Printf("Job Queued: %s\n", id)
-	return newFunc, nil
+	return fn, nil
 }
 
 // RunFunction is the resolver for the runFunction field.
 func (r *mutationResolver) RunFunction(ctx context.Context, functionID string) (*model.Execution, error) {
-	panic(fmt.Errorf("not implemented: RunFunction - runFunction"))
+	val, err := r.Redis.HGet(ctx, "function:"+functionID, "meta").Result()
+	if err != nil {
+		return nil, fmt.Errorf("function not found: %v", err)
+	}
+
+	var fn model.Function
+	if err := json.Unmarshal([]byte(val), &fn); err != nil {
+		return nil, fmt.Errorf("failed to parse function: %v", err)
+	}
+
+	execID := uuid.NewString()
+
+	pipe := r.Redis.Pipeline()
+	pipe.HSet(ctx, "execution:"+execID,
+		"id", execID,
+		"functionId", functionID,
+		"status", string(model.StatusQueued),
+	)
+	pipe.Expire(ctx, "execution:"+execID, 24*time.Hour)
+	pipe.LPush(ctx, "executions:"+functionID, execID)
+	pipe.Expire(ctx, "executions:"+functionID, 24*time.Hour)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, fmt.Errorf("failed to save execution: %v", err)
+	}
+
+	job := shared.JobPayload{
+		ExecutionID: execID,
+		FunctionID:  functionID,
+		Language:    fn.Language.String(),
+		Code:        fn.Code,
+	}
+
+	jobData, err := json.Marshal(job)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize job: %v", err)
+	}
+
+	if err := r.Redis.RPush(ctx, jobQueue, jobData).Err(); err != nil {
+		return nil, fmt.Errorf("failed to queue job: %v", err)
+	}
+
+	return &model.Execution{
+		ID:         execID,
+		FunctionID: functionID,
+		Status:     model.StatusQueued,
+	}, nil
 }
 
 // Functions is the resolver for the functions field.
 func (r *queryResolver) Functions(ctx context.Context) ([]*model.Function, error) {
-	keys, err := rdb.Keys(ctx, "function:*").Result()
+	keys, err := r.Redis.Keys(ctx, "function:*").Result()
 	if err != nil {
 		return nil, err
 	}
 
-	var allFunctions []*model.Function
-
+	var functions []*model.Function
 	for _, key := range keys {
-		val, err := rdb.HGet(ctx, key, "meta").Result()
-		if err == nil {
-			var f model.Function
-			json.Unmarshal([]byte(val), &f)
-			allFunctions = append(allFunctions, &f)
+		val, err := r.Redis.HGet(ctx, key, "meta").Result()
+		if err != nil {
+			continue
 		}
+		var fn model.Function
+		if err := json.Unmarshal([]byte(val), &fn); err != nil {
+			continue
+		}
+		functions = append(functions, &fn)
 	}
 
-	return allFunctions, nil
+	return functions, nil
 }
 
 // Execution is the resolver for the execution field.
 func (r *queryResolver) Execution(ctx context.Context, id string) (*model.Execution, error) {
-	panic(fmt.Errorf("not implemented: Execution - execution"))
+	vals, err := r.Redis.HGetAll(ctx, "execution:"+id).Result()
+	if err != nil || len(vals) == 0 {
+		return nil, fmt.Errorf("execution not found")
+	}
+
+	exec := &model.Execution{
+		ID:         vals["id"],
+		FunctionID: vals["functionId"],
+		Status:     model.Status(vals["status"]),
+	}
+	if result, ok := vals["result"]; ok && result != "" {
+		exec.Result = &result
+	}
+
+	return exec, nil
+}
+
+// ExecutionsByFunction is the resolver for the executionsByFunction field.
+func (r *queryResolver) ExecutionsByFunction(ctx context.Context, functionID string) ([]*model.Execution, error) {
+	execIDs, err := r.Redis.LRange(ctx, "executions:"+functionID, 0, -1).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	var executions []*model.Execution
+	for _, id := range execIDs {
+		vals, err := r.Redis.HGetAll(ctx, "execution:"+id).Result()
+		if err != nil || len(vals) == 0 {
+			continue
+		}
+		exec := &model.Execution{
+			ID:         vals["id"],
+			FunctionID: vals["functionId"],
+			Status:     model.Status(vals["status"]),
+		}
+		if result, ok := vals["result"]; ok && result != "" {
+			exec.Result = &result
+		}
+		executions = append(executions, exec)
+	}
+
+	return executions, nil
 }
 
 // FunctionLogs is the resolver for the functionLogs field.
 func (r *subscriptionResolver) FunctionLogs(ctx context.Context, executionID string) (<-chan *model.Log, error) {
-	panic(fmt.Errorf("not implemented: FunctionLogs - functionLogs"))
+	ch := make(chan *model.Log, 100)
+
+	go func() {
+		defer close(ch)
+
+		pubsub := r.Redis.Subscribe(ctx, "logs:"+executionID)
+		defer pubsub.Close()
+
+		for msg := range pubsub.Channel() {
+			var entry shared.LogEntry
+			if err := json.Unmarshal([]byte(msg.Payload), &entry); err != nil {
+				continue
+			}
+			if entry.Done {
+				return
+			}
+			ch <- &model.Log{
+				ExecutionID: executionID,
+				Message:     entry.Message,
+				Level:       entry.Level,
+				Timestamp:   entry.Timestamp,
+			}
+		}
+	}()
+
+	return ch, nil
 }
 
 // Mutation returns MutationResolver implementation.
@@ -104,18 +203,3 @@ func (r *Resolver) Subscription() SubscriptionResolver { return &subscriptionRes
 type mutationResolver struct{ *Resolver }
 type queryResolver struct{ *Resolver }
 type subscriptionResolver struct{ *Resolver }
-
-// !!! WARNING !!!
-// The code below was going to be deleted when updating resolvers. It has been copied here so you have
-// one last chance to move it out of harms way if you want. There are two reasons this happens:
-//  - When renaming or deleting a resolver the old code will be put in here. You can safely delete
-//    it when you're done.
-//  - You have helper methods in this file. Move them out to keep these resolver files clean.
-/*
-	func (r *mutationResolver) CreateTodo(ctx context.Context, input model.NewTodo) (*model.Todo, error) {
-	panic(fmt.Errorf("not implemented: CreateTodo - createTodo"))
-}
-func (r *queryResolver) Todos(ctx context.Context) ([]*model.Todo, error) {
-	panic(fmt.Errorf("not implemented: Todos - todos"))
-}
-*/

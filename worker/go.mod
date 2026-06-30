@@ -3,6 +3,7 @@ module github.com/Rishab-Kumar-R/nano-faas/worker
 go 1.25.5
 
 require (
+	github.com/Rishab-Kumar-R/nano-faas/shared v0.0.0
 	github.com/docker/docker v28.5.2+incompatible
 	github.com/redis/go-redis/v9 v9.17.2
 )
@@ -44,3 +45,5 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	gotest.tools/v3 v3.5.2 // indirect
 )
+
+replace github.com/Rishab-Kumar-R/nano-faas/shared => ../shared

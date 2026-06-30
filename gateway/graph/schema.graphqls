@@ -38,6 +38,8 @@ type Query {
   functions: [Function!]!
   # Get details of a specific execution
   execution(id: ID!): Execution
+  # List all executions for a function
+  executionsByFunction(functionId: ID!): [Execution!]!
 }
 
 type Mutation {
