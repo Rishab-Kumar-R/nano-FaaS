@@ -139,8 +139,12 @@ func TestQueryFunctions(t *testing.T) {
 	e := newTestEnv(t)
 	ctx := context.Background()
 
-	e.mut().CreateFunction(ctx, "a", model.LanguagePython, `1`)
-	e.mut().CreateFunction(ctx, "b", model.LanguageNodejs, `2`)
+	if _, err := e.mut().CreateFunction(ctx, "a", model.LanguagePython, `1`); err != nil {
+		t.Fatalf("CreateFunction a: %v", err)
+	}
+	if _, err := e.mut().CreateFunction(ctx, "b", model.LanguageNodejs, `2`); err != nil {
+		t.Fatalf("CreateFunction b: %v", err)
+	}
 
 	fns, err := e.qry().Functions(ctx)
 	if err != nil {
@@ -156,8 +160,12 @@ func TestExecutionsByFunction(t *testing.T) {
 	ctx := context.Background()
 
 	fn, _ := e.mut().CreateFunction(ctx, "multi", model.LanguagePython, `print("x")`)
-	e.mut().RunFunction(ctx, fn.ID)
-	e.mut().RunFunction(ctx, fn.ID)
+	if _, err := e.mut().RunFunction(ctx, fn.ID); err != nil {
+		t.Fatalf("RunFunction: %v", err)
+	}
+	if _, err := e.mut().RunFunction(ctx, fn.ID); err != nil {
+		t.Fatalf("RunFunction: %v", err)
+	}
 
 	execs, err := e.qry().ExecutionsByFunction(ctx, fn.ID)
 	if err != nil {

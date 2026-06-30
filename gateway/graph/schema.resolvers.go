@@ -169,7 +169,7 @@ func (r *subscriptionResolver) FunctionLogs(ctx context.Context, executionID str
 		defer close(ch)
 
 		pubsub := r.Redis.Subscribe(ctx, "logs:"+executionID)
-		defer pubsub.Close()
+		defer func() { _ = pubsub.Close() }()
 
 		for msg := range pubsub.Channel() {
 			var entry shared.LogEntry
