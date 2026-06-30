@@ -39,8 +39,12 @@ func NewManager() (*Manager, error) {
 	return &Manager{cli: cli}, nil
 }
 
-func (m *Manager) RunCode(ctx context.Context, language, code string, publish func(msg, level string)) error {
+func (m *Manager) RunCode(ctx context.Context, language, code, input string, publish func(msg, level string)) error {
 	img, cmd, env := runtimeConfig(language, code)
+
+	if input != "" {
+		env = append(env, "NANO_INPUT="+input)
+	}
 
 	reader, err := m.cli.ImagePull(ctx, img, image.PullOptions{})
 	if err != nil {
@@ -61,14 +65,13 @@ func (m *Manager) RunCode(ctx context.Context, language, code string, publish fu
 				Memory:   memoryLimit,
 				NanoCPUs: nanoCPUs,
 			},
-			NetworkMode: "none", // no outbound network access
+			NetworkMode: "none",
 		},
 		nil, nil, "")
 	if err != nil {
 		return fmt.Errorf("failed to create container: %v", err)
 	}
 
-	// Use a background context for cleanup so it runs even if ctx is cancelled (timeout).
 	defer func() {
 		cleanupCtx := context.Background()
 		_ = m.cli.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{Force: true})
@@ -121,8 +124,6 @@ func runtimeConfig(language, code string) (img string, cmd []string, env []strin
 	case "NODEJS":
 		return "node:18-alpine", []string{"node", "-e", code}, nil
 	case "GO":
-		// Code passed via env var to avoid shell-escaping issues.
-		// Auto-wrap bare snippets (no package declaration) in a main() function.
 		return "golang:1.21-alpine",
 			[]string{"sh", "-c", `printf '%s' "$NANO_CODE" > /tmp/main.go && go run /tmp/main.go`},
 			[]string{"NANO_CODE=" + wrapGoCode(code)}
@@ -131,7 +132,6 @@ func runtimeConfig(language, code string) (img string, cmd []string, env []strin
 	}
 }
 
-// wrapGoCode adds a package main + func main() around snippets that omit them.
 func wrapGoCode(code string) string {
 	if strings.Contains(code, "package main") {
 		return code

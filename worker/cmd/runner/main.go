@@ -12,10 +12,15 @@ import (
 
 	"github.com/Rishab-Kumar-R/nano-faas/shared"
 	"github.com/Rishab-Kumar-R/nano-faas/worker/internal/runtime"
+	"github.com/Rishab-Kumar-R/nano-faas/worker/internal/scheduler"
 	"github.com/redis/go-redis/v9"
 )
 
-const jobQueue = "job_queue"
+const (
+	jobQueue    = "job_queue"
+	dlq         = "dead_letter_queue"
+	maxRetries  = 3
+)
 
 func main() {
 	redisAddr := os.Getenv("REDIS_ADDR")
@@ -44,6 +49,10 @@ func main() {
 	if err != nil {
 		panic(fmt.Sprintf("failed to connect to Podman: %v", err))
 	}
+
+	sched := scheduler.New(rdb)
+	sched.Start(ctx)
+	defer sched.Stop()
 
 	fmt.Printf("Connected to Podman. Starting %d workers (timeout: %s)...\n", workerCount, execTimeout)
 
@@ -75,7 +84,7 @@ func runWorker(ctx context.Context, rdb *redis.Client, engine *runtime.Manager, 
 			continue
 		}
 
-		fmt.Printf("[worker %d] running job %s (function %s)\n", id, job.ExecutionID, job.FunctionID)
+		fmt.Printf("[worker %d] running job %s (function %s, retry %d)\n", id, job.ExecutionID, job.FunctionID, job.RetryCount)
 		processJob(ctx, rdb, engine, timeout, job)
 	}
 }
@@ -100,17 +109,41 @@ func processJob(ctx context.Context, rdb *redis.Client, engine *runtime.Manager,
 		rdb.Publish(ctx, "logs:"+job.ExecutionID, data)
 	}
 
-	err := engine.RunCode(execCtx, job.Language, job.Code, publish)
+	err := engine.RunCode(execCtx, job.Language, job.Code, job.Input, publish)
 
 	done, _ := json.Marshal(shared.LogEntry{Done: true})
 	rdb.Publish(ctx, "logs:"+job.ExecutionID, done)
 
+	output := strings.Join(outputLines, "\n")
+	result := shared.ResultPayload{Output: output}
+
 	if err != nil {
-		fmt.Printf("job %s failed: %v\n", job.ExecutionID, err)
-		setStatus(ctx, rdb, job.ExecutionID, "FAILED", err.Error())
+		fmt.Printf("job %s failed (retry %d/%d): %v\n", job.ExecutionID, job.RetryCount, maxRetries, err)
+		result.Error = err.Error()
+
+		if job.RetryCount < maxRetries {
+			job.RetryCount++
+			data, _ := json.Marshal(job)
+			rdb.RPush(ctx, jobQueue, data)
+			setStatus(ctx, rdb, job.ExecutionID, "QUEUED", "")
+		} else {
+			entry := shared.DeadLetterEntry{
+				ExecutionID: job.ExecutionID,
+				FunctionID:  job.FunctionID,
+				Language:    job.Language,
+				Error:       err.Error(),
+				Retries:     job.RetryCount,
+			}
+			data, _ := json.Marshal(entry)
+			rdb.LPush(ctx, dlq, data)
+			setStatus(ctx, rdb, job.ExecutionID, "FAILED", err.Error())
+		}
 	} else {
-		setStatus(ctx, rdb, job.ExecutionID, "COMPLETED", strings.Join(outputLines, "\n"))
+		setStatus(ctx, rdb, job.ExecutionID, "COMPLETED", output)
 	}
+
+	resultData, _ := json.Marshal(result)
+	rdb.Publish(ctx, "result:"+job.ExecutionID, resultData)
 }
 
 func setStatus(ctx context.Context, rdb *redis.Client, execID, status, result string) {

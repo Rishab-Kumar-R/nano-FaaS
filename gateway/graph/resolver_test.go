@@ -66,7 +66,7 @@ func TestRunFunction_NotFound(t *testing.T) {
 	e := newTestEnv(t)
 	ctx := context.Background()
 
-	_, err := e.mut().RunFunction(ctx, "nonexistent")
+	_, err := e.mut().RunFunction(ctx, "nonexistent", nil)
 	if err == nil {
 		t.Fatal("expected error for missing function, got nil")
 	}
@@ -77,7 +77,7 @@ func TestRunFunction_CreatesExecution(t *testing.T) {
 	ctx := context.Background()
 
 	fn, _ := e.mut().CreateFunction(ctx, "runner", model.LanguagePython, `print("x")`)
-	exec, err := e.mut().RunFunction(ctx, fn.ID)
+	exec, err := e.mut().RunFunction(ctx, fn.ID, nil)
 	if err != nil {
 		t.Fatalf("RunFunction: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestQueryExecution(t *testing.T) {
 	ctx := context.Background()
 
 	fn, _ := e.mut().CreateFunction(ctx, "q", model.LanguagePython, `print("q")`)
-	created, _ := e.mut().RunFunction(ctx, fn.ID)
+	created, _ := e.mut().RunFunction(ctx, fn.ID, nil)
 
 	exec, err := e.qry().Execution(ctx, created.ID)
 	if err != nil {
@@ -160,10 +160,10 @@ func TestExecutionsByFunction(t *testing.T) {
 	ctx := context.Background()
 
 	fn, _ := e.mut().CreateFunction(ctx, "multi", model.LanguagePython, `print("x")`)
-	if _, err := e.mut().RunFunction(ctx, fn.ID); err != nil {
+	if _, err := e.mut().RunFunction(ctx, fn.ID, nil); err != nil {
 		t.Fatalf("RunFunction: %v", err)
 	}
-	if _, err := e.mut().RunFunction(ctx, fn.ID); err != nil {
+	if _, err := e.mut().RunFunction(ctx, fn.ID, nil); err != nil {
 		t.Fatalf("RunFunction: %v", err)
 	}
 
