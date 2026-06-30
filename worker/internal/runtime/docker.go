@@ -46,8 +46,8 @@ func (m *Manager) RunCode(ctx context.Context, language, code string, publish fu
 	if err != nil {
 		return fmt.Errorf("failed to pull image: %v", err)
 	}
-	io.Copy(io.Discard, reader)
-	reader.Close()
+	_, _ = io.Copy(io.Discard, reader)
+	_ = reader.Close()
 
 	resp, err := m.cli.ContainerCreate(ctx,
 		&container.Config{
@@ -71,7 +71,7 @@ func (m *Manager) RunCode(ctx context.Context, language, code string, publish fu
 	// Use a background context for cleanup so it runs even if ctx is cancelled (timeout).
 	defer func() {
 		cleanupCtx := context.Background()
-		m.cli.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{Force: true})
+		_ = m.cli.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{Force: true})
 	}()
 
 	if err := m.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
@@ -86,7 +86,7 @@ func (m *Manager) RunCode(ctx context.Context, language, code string, publish fu
 	if err != nil {
 		return fmt.Errorf("failed to attach logs: %v", err)
 	}
-	defer logOut.Close()
+	defer func() { _ = logOut.Close() }()
 
 	stdoutR, stdoutW := io.Pipe()
 	stderrR, stderrW := io.Pipe()
@@ -108,9 +108,9 @@ func (m *Manager) RunCode(ctx context.Context, language, code string, publish fu
 		}
 	}()
 
-	stdcopy.StdCopy(stdoutW, stderrW, logOut)
-	stdoutW.Close()
-	stderrW.Close()
+	_, _ = stdcopy.StdCopy(stdoutW, stderrW, logOut)
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
 	wg.Wait()
 
 	return ctx.Err()
